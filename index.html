@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>教育施設GeoJSONマップ（ローカル対応版）</title>
+  <title>教育施設GeoJSONマップ（ネットワーク版）</title>
   <link
     rel="stylesheet"
     href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
@@ -17,10 +17,11 @@
     .header h1 { margin:0 0 6px 0; font-size:18px; }
     .header p { margin:4px 0; font-size:13px; color:#444; line-height:1.5; }
     .controls { margin-top:8px; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-    .btn, .file-label, select {
+    .btn, .file-label, select, input[type="text"] {
       display:inline-block; padding:8px 12px; border-radius:8px; border:1px solid #c8d3e1;
-      background:#fff; cursor:pointer; font-size:13px;
+      background:#fff; font-size:13px;
     }
+    .btn, .file-label { cursor:pointer; }
     .btn:hover, .file-label:hover { background:#f7faff; }
     input[type="file"] { display:none; }
     #status { margin-top:8px; font-size:13px; color:#1f4b99; white-space:pre-wrap; }
@@ -37,25 +38,32 @@
     }
     .legend-item { display:flex; align-items:center; gap:6px; margin:2px 0; }
     .legend-dot { width:10px; height:10px; border-radius:50%; display:inline-block; }
+    .wide { min-width: 240px; }
   </style>
 </head>
 <body>
   <div class="app">
     <div class="header">
-      <h1>教育施設GeoJSONマップ（ローカル対応版）</h1>
-      <p>地図タイルは OpenStreetMap 直結をやめて、ローカルHTMLでも動きやすい別のベースマップを使います。</p>
-      <p>GeoJSON は同じフォルダからの自動読込を試し、失敗した場合はファイル選択で直接読み込みます。</p>
+      <h1>教育施設GeoJSONマップ（ネットワーク版）</h1>
+      <p>HTTP/HTTPS のネットワーク配信を前提に、同じフォルダ内のデータ一覧ファイルから GeoJSON を選択して読み込みます。</p>
+      <p><strong>使い方:</strong> この HTML と同じフォルダに <code>data-files.json</code> を置き、その中に選択対象の GeoJSON ファイル名を列挙してください。</p>
 
       <div class="controls">
-        <button id="retryBtn" class="btn" type="button">同じフォルダから再読込</button>
-        <label class="file-label" for="fileInput">GeoJSONファイルを選択</label>
+        <button id="reloadListBtn" class="btn" type="button">データ一覧を再読込</button>
+        <select id="dataFileSelect" class="wide">
+          <option value="">データファイルを選択してください</option>
+        </select>
+        <button id="loadSelectedBtn" class="btn" type="button">選択ファイルを表示</button>
+        <input id="manualFileName" class="wide" type="text" placeholder="例: P29-23_13.geojson" />
+        <button id="loadManualBtn" class="btn" type="button">ファイル名で表示</button>
+        <label class="file-label" for="fileInput">手元のGeoJSONを選択</label>
         <input id="fileInput" type="file" accept=".geojson,.json,application/geo+json,application/json" />
         <select id="typeFilter">
           <option value="">すべての種別</option>
         </select>
       </div>
 
-      <div id="status">GeoJSONを読み込み中です...</div>
+      <div id="status">データ一覧を読み込み中です...</div>
     </div>
     <div id="map"></div>
   </div>
@@ -66,7 +74,8 @@
     crossorigin=""
   ></script>
   <script>
-    const GEOJSON_FILE = 'P29-23_13.geojson';
+    const DATA_LIST_FILE = 'data-files.json';
+    const DEFAULT_GEOJSON_FILE = 'P29-23_13.geojson';
 
     const schoolTypeMap = {
       "16001": "小学校",
@@ -101,8 +110,6 @@
     };
 
     const map = L.map('map').setView([35.681236, 139.767125], 10);
-
-    // OSM直結ではなくCARTOのベースマップを使用
     const baseLayer = L.tileLayer(
       'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
       {
@@ -115,11 +122,16 @@
     const markers = L.layerGroup().addTo(map);
     const status = document.getElementById('status');
     const fileInput = document.getElementById('fileInput');
-    const retryBtn = document.getElementById('retryBtn');
     const typeFilter = document.getElementById('typeFilter');
+    const dataFileSelect = document.getElementById('dataFileSelect');
+    const reloadListBtn = document.getElementById('reloadListBtn');
+    const loadSelectedBtn = document.getElementById('loadSelectedBtn');
+    const manualFileName = document.getElementById('manualFileName');
+    const loadManualBtn = document.getElementById('loadManualBtn');
 
     let currentGeoJSON = null;
     let currentSourceLabel = '';
+    let availableFiles = [];
 
     function escapeHtml(value) {
       if (value === null || value === undefined) return '';
@@ -168,6 +180,61 @@
         option.value = code;
         option.textContent = `${getTypeName(code)} (${code})`;
         typeFilter.appendChild(option);
+      }
+    }
+
+    function setDataFileOptions(files) {
+      availableFiles = files;
+      dataFileSelect.innerHTML = '<option value="">データファイルを選択してください</option>';
+      for (const file of files) {
+        const option = document.createElement('option');
+        option.value = file;
+        option.textContent = file;
+        dataFileSelect.appendChild(option);
+      }
+    }
+
+    function normalizeDataFileList(data) {
+      if (Array.isArray(data)) return data;
+      if (data && Array.isArray(data.files)) return data.files;
+      throw new Error('data-files.json は ["a.geojson", "b.geojson"] または {"files":[...]} の形式で記述してください。');
+    }
+
+    async function loadDataList() {
+      status.textContent = 'データ一覧を読み込み中です...';
+      try {
+        const response = await fetch(DATA_LIST_FILE + '?t=' + Date.now(), { cache: 'no-store' });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status} ${response.statusText}`);
+        }
+        const data = await response.json();
+        const files = normalizeDataFileList(data)
+          .filter(name => typeof name === 'string' && name.trim())
+          .map(name => name.trim());
+
+        if (files.length === 0) {
+          throw new Error('data-files.json にファイル名が1件もありません。');
+        }
+
+        setDataFileOptions(files);
+
+        if (files.includes(DEFAULT_GEOJSON_FILE)) {
+          dataFileSelect.value = DEFAULT_GEOJSON_FILE;
+          await loadGeoJSONFromPath(DEFAULT_GEOJSON_FILE, `${DEFAULT_GEOJSON_FILE}（一覧ファイル既定値）`);
+        } else {
+          status.innerHTML =
+            `<span class="ok">データ一覧を読み込みました。</span>\n` +
+            `候補数: ${files.length} 件\n` +
+            `上の「データファイルを選択してください」から選んで表示してください。`;
+        }
+      } catch (error) {
+        console.error('データ一覧の読み込みエラー:', error);
+        setDataFileOptions([]);
+        status.innerHTML =
+          `<span class="note">データ一覧の読込に失敗しました。</span>\n` +
+          `原因: ${escapeHtml(error.message)}\n\n` +
+          `この HTML と同じフォルダに data-files.json を置いてください。\n` +
+          `例: [\"P29-23_13.geojson\", \"P29-23_21.geojson\"]`;
       }
     }
 
@@ -229,34 +296,40 @@
         `読込元: ${escapeHtml(currentSourceLabel)}${filterLabel}`;
     }
 
-    async function loadFromSameFolder() {
-      status.textContent = '同じフォルダにある GeoJSON を読み込み中です...';
+    async function loadGeoJSONFromPath(filePath, sourceLabel) {
+      const safePath = String(filePath || '').trim();
+      if (!safePath) {
+        status.innerHTML = '<span class="note">ファイル名を指定してください。</span>';
+        return;
+      }
+
+      status.textContent = `ネットワーク上のファイルを読み込み中です: ${safePath}`;
       try {
-        const response = await fetch(GEOJSON_FILE);
+        const response = await fetch(safePath + '?t=' + Date.now(), { cache: 'no-store' });
         if (!response.ok) {
           throw new Error(`HTTP ${response.status} ${response.statusText}`);
         }
         const geojson = await response.json();
-        renderGeoJSON(geojson, `${GEOJSON_FILE}（同じフォルダ）`);
+        renderGeoJSON(geojson, sourceLabel || `${safePath}（ネットワーク）`);
       } catch (error) {
-        console.error('fetch 読み込みエラー:', error);
+        console.error('GeoJSON読み込みエラー:', error);
         status.innerHTML =
-          `<span class="note">同じフォルダからの自動読込に失敗しました。</span>\n` +
+          `<span class="note">ネットワーク上のファイル読込に失敗しました。</span>\n` +
           `原因: ${escapeHtml(error.message)}\n\n` +
-          `下の「GeoJSONファイルを選択」から直接読み込んでください。`;
+          `ファイル名・配置場所・Webサーバーの公開設定を確認してください。`;
       }
     }
 
     function loadFromSelectedFile(file) {
       if (!file) return;
-      status.textContent = `選択したファイルを読み込み中です: ${file.name}`;
+      status.textContent = `選択した手元ファイルを読み込み中です: ${file.name}`;
       const reader = new FileReader();
 
       reader.onload = function(event) {
         try {
           const text = event.target.result;
           const geojson = JSON.parse(text);
-          renderGeoJSON(geojson, `${file.name}（ファイル選択）`);
+          renderGeoJSON(geojson, `${file.name}（手元ファイル）`);
         } catch (error) {
           console.error('FileReader 読み込みエラー:', error);
           status.innerHTML =
@@ -273,7 +346,26 @@
     }
 
     typeFilter.addEventListener('change', renderFiltered);
-    retryBtn.addEventListener('click', loadFromSameFolder);
+
+    reloadListBtn.addEventListener('click', loadDataList);
+
+    loadSelectedBtn.addEventListener('click', function() {
+      const fileName = dataFileSelect.value;
+      loadGeoJSONFromPath(fileName, `${fileName}（一覧選択）`);
+    });
+
+    loadManualBtn.addEventListener('click', function() {
+      const fileName = manualFileName.value.trim();
+      loadGeoJSONFromPath(fileName, `${fileName}（手入力）`);
+    });
+
+    manualFileName.addEventListener('keydown', function(event) {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        loadManualBtn.click();
+      }
+    });
+
     fileInput.addEventListener('change', function(event) {
       const file = event.target.files && event.target.files[0];
       loadFromSelectedFile(file);
@@ -298,7 +390,7 @@
       status.innerHTML += '\nベースマップの読込に失敗した場合でも、施設ポイント自体は表示できます。';
     });
 
-    loadFromSameFolder();
+    loadDataList();
   </script>
 </body>
 </html>
